@@ -45,13 +45,15 @@ func (c ConnectionStatus) String() string {
 
 // Config holds the configuration for the client
 type Config struct {
-	PlatformURL string
+	PlatformURL  string
+	PingInterval time.Duration
 }
 
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig() Config {
 	return Config{
-		PlatformURL: "wss://llphq.com/agent/websocket",
+		PlatformURL:  "wss://llphq.com/agent/websocket",
+		PingInterval: 5 * time.Second,
 	}
 }
 
@@ -140,7 +142,7 @@ func (c *Client) connect(ctx context.Context) error {
 	c.connMu.Unlock()
 
 	c.setStatus(Connected)
-	c.logger.Info("connected to server")
+	c.logger.Info("connected to server", "address", c.config.PlatformURL)
 
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
@@ -187,7 +189,7 @@ func (c *Client) Close() error {
 		return ErrAlreadyClosed
 	}
 
-	c.logger.Info("closing client")
+	c.logger.Debug("closing client")
 
 	// Auto-presence: send unavailable if we announced presence
 	c.presenceAnnouncedMu.Lock()
@@ -200,7 +202,7 @@ func (c *Client) Close() error {
 		defer cancel()
 
 		if err := c.setPresence(ctx, Unavailable); err != nil {
-			c.logger.Warn("auto-unavailable failed during close", "error", err)
+			c.logger.Warn("auto-unavailable failed during close, continuing with shutdown anyway", "error", err)
 			// Continue with shutdown anyway
 		}
 	}
@@ -209,7 +211,7 @@ func (c *Client) Close() error {
 	c.wg.Wait()
 
 	c.setStatus(Closed)
-	c.logger.Info("client closed")
+	c.logger.Debug("client closed")
 
 	return nil
 }
@@ -260,8 +262,6 @@ func (c *Client) authenticate(ctx context.Context) error {
 		Name: c.name,
 		Key:  c.apiKey,
 	}
-
-	c.logger.Info("authenticating", "name", c.name, "key", c.apiKey)
 
 	data, err := json.Marshal(authMsg)
 	if err != nil {
@@ -341,7 +341,7 @@ func (c *Client) setPresence(ctx context.Context, status PresenceStatus) error {
 		return ErrNotAuthed
 	}
 
-	c.logger.Info("sending presence", "status", status.String())
+	c.logger.Debug("sending presence", "status", status.String())
 
 	p := PresenceMessageJSON{
 		Type: "presence",
@@ -434,9 +434,9 @@ func (c *Client) writeLoop(ctx context.Context) {
 				return
 			}
 
-			c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(c.config.PingInterval))
 
-			c.logger.Info("writing message")
+			c.logger.Debug("writing message")
 			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				c.logger.Error("write error", "error", err)
 				c.handleDisconnect()
@@ -552,10 +552,11 @@ func (c *Client) handleMessageCallback(ctx context.Context, ID string, data []by
 	m := msg.Data.Prompt
 
 	tm := TextMessage{
-		Sender:    msg.From,
-		Recipient: msg.Data.To,
-		Prompt:    string(m),
-		ID:        msg.ID,
+		Sender:     msg.From,
+		Recipient:  msg.Data.To,
+		Prompt:     string(m),
+		ID:         msg.ID,
+		Attachment: msg.Data.Attachment,
 	}
 
 	if exists {
