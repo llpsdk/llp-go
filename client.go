@@ -552,10 +552,11 @@ func (c *Client) handleMessageCallback(ctx context.Context, ID string, data []by
 	m := msg.Data.Prompt
 
 	tm := TextMessage{
-		Sender:    msg.From,
-		Recipient: msg.Data.To,
-		Prompt:    string(m),
-		ID:        msg.ID,
+		Sender:     msg.From,
+		Recipient:  msg.Data.To,
+		Prompt:     string(m),
+		ID:         msg.ID,
+		Attachment: msg.Data.Attachment,
 	}
 
 	if exists {

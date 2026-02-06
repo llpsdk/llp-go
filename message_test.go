@@ -101,6 +101,26 @@ func TestMessage_Unmarshal(t *testing.T) {
 	assert.Equal(t, "789", msg.Data.To)
 	assert.Equal(t, []byte("hello"), msg.Data.Prompt)
 	assert.False(t, msg.Data.Encrypted)
+	assert.Equal(t, "", msg.Data.Attachment)
+}
+
+func TestMessage_Attachment_Unmarshal(t *testing.T) {
+	jsonData := []byte(`{
+		"type": "message",
+		"from": "456",
+		"id": "req-1",
+		"data": {
+			"to": "789",
+            "encrypted": false,
+			"prompt": "aGVsbG8=",
+            "attachment_url": "https://llphq.com/api/v1/attachment/hello.txt"
+		}
+	}`)
+
+	var msg TextMessageJSON
+	err := json.Unmarshal(jsonData, &msg)
+	require.NoError(t, err)
+	assert.Equal(t, "https://llphq.com/api/v1/attachment/hello.txt", msg.Data.Attachment)
 }
 
 func TestErrorMessage_Unmarshal(t *testing.T) {

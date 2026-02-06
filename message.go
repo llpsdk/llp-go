@@ -7,14 +7,19 @@ import (
 )
 
 type TextMessage struct {
-	ID        string
-	Recipient string
-	Sender    string
-	Prompt    string
+	ID         string
+	Recipient  string
+	Sender     string
+	Prompt     string
+	Attachment string
 }
 
 func (t TextMessage) Reply(message string) TextMessage {
 	return TextMessage{Recipient: t.Sender, ID: t.ID, Prompt: message}
+}
+
+func (t TextMessage) HasAttachment() bool {
+	return t.Attachment != ""
 }
 
 func NewTextMessage(to, message string) TextMessage {
@@ -35,9 +40,10 @@ type TextMessageJSON struct {
 }
 
 type TextMessageData struct {
-	To        string `json:"to"`
-	Encrypted bool   `json:"encrypted"`
-	Prompt    []byte `json:"prompt"`
+	To         string `json:"to"`
+	Encrypted  bool   `json:"encrypted"`
+	Prompt     []byte `json:"prompt"`
+	Attachment string `json:"attachment_url,omitempty"`
 }
 
 // Outbound messages (client → server)
