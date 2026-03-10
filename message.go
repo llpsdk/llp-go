@@ -2,6 +2,7 @@ package llp
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,12 +19,61 @@ func (t TextMessage) Reply(message string) TextMessage {
 	return TextMessage{Recipient: t.Sender, ID: t.ID, Prompt: message}
 }
 
+func (t TextMessage) ToolCall(name, parameters, result string, duration time.Duration) ToolCall {
+	return ToolCall{
+		ID:             t.ID,
+		Recipient:      t.Sender,
+		ThrewException: false,
+		Duration:       duration,
+		Name:           name,
+		Parameters:     parameters,
+		Result:         result,
+	}
+}
+
+func (t TextMessage) ToolCallException(name, parameters string, err error, duration time.Duration) ToolCall {
+	return ToolCall{
+		ID:             t.ID,
+		Recipient:      t.Sender,
+		ThrewException: true,
+		Duration:       duration,
+		Name:           name,
+		Parameters:     parameters,
+		Result:         err.Error(),
+	}
+}
+
 func (t TextMessage) HasAttachment() bool {
 	return t.Attachment != ""
 }
 
 func NewTextMessage(to, message string) TextMessage {
 	return TextMessage{Recipient: to, Prompt: message, ID: uuid.NewString()}
+}
+
+type ToolCall struct {
+	ID             string
+	Recipient      string
+	Name           string
+	Parameters     string
+	Result         string
+	ThrewException bool
+	Duration       time.Duration
+}
+
+type ToolCallJSON struct {
+	Type string       `json:"type"`
+	ID   string       `json:"id"`
+	Data ToolCallData `json:"data"`
+}
+
+type ToolCallData struct {
+	To             string `json:"to"`
+	Name           string `json:"name"`
+	Parameters     string `json:"parameters"`
+	Result         string `json:"result"`
+	ThrewException bool   `json:"threw_exception"`
+	Duration       int64  `json:"duration_ms"`
 }
 
 type PresenceMessage struct {

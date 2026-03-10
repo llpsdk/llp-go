@@ -37,6 +37,10 @@ func (e *PlatformError) Error() string {
 	return fmt.Sprintf("platform error %d: %s", e.Code, e.Message)
 }
 
+func (e *PlatformError) Is(err error) bool {
+	return err.Error() == e.Error()
+}
+
 // Sentinel errors for client-side conditions
 var (
 	ErrNotConnected  = errors.New("not connected")
