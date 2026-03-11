@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/llpsdk/llp-go"
 )
@@ -20,10 +22,15 @@ func main() {
 	flag.Parse()
 
 	apiKey := os.Getenv("LLP_API_KEY")
+	slog.SetLogLoggerLevel(slog.LevelDebug)
 	client, err := llp.NewClient(name, apiKey).
-		OnMessage(func(ctx context.Context, msg llp.TextMessage) (llp.TextMessage, error) {
+		OnMessage(func(ctx context.Context, telemetry llp.Annotater, msg llp.TextMessage) (llp.TextMessage, error) {
 			log.Printf("Received message: %v", msg.Prompt)
 			// process prompt with your agent
+			tc := msg.ToolCall("get_weather", `{"city":"San Francisco"}`, "foggy", 1000*time.Millisecond)
+			if err := telemetry.AnnotateToolCall(ctx, tc); err != nil {
+				return llp.TextMessage{}, err
+			}
 			return msg.Reply("hello"), nil
 		}).
 		Connect(ctx)
@@ -34,10 +41,10 @@ func main() {
 	log.Printf("client is connected and authenticated")
 
 	log.Printf("waiting for ctrl+c")
-	<-ctx.Done()
-	log.Printf("shutting down")
-	err = client.Close()
-	if err != nil {
-		log.Printf("error shutting down: %v", err)
+	client.AwaitResult(ctx)
+	if err = client.AwaitResult(ctx); err != nil {
+		log.Printf("test failed")
+		os.Exit(1)
 	}
+	log.Printf("test passed")
 }

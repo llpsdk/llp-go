@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+type MockAnnotater struct {
+}
+
+func (ma *MockAnnotater) AnnotateToolCall(ctx context.Context, toolCall ToolCall) error {
+	return nil
+}
+
 func TestHandlerRegistry_SetAndCall(t *testing.T) {
 	registry := newHandlerRegistry()
 	ctx := context.Background()
@@ -14,7 +21,7 @@ func TestHandlerRegistry_SetAndCall(t *testing.T) {
 		var called bool
 		var receivedMsg PresenceMessage
 
-		registry.setPresence(func(ctx context.Context, client *Client, msg PresenceMessage) {
+		registry.setPresence(func(ctx context.Context, msg PresenceMessage) {
 			called = true
 			receivedMsg = msg
 		})
@@ -24,7 +31,7 @@ func TestHandlerRegistry_SetAndCall(t *testing.T) {
 			Status: Available,
 		}
 
-		registry.callPresence(ctx, nil, msg)
+		registry.callPresence(ctx, msg)
 
 		if !called {
 			t.Error("handler was not called")
@@ -38,7 +45,7 @@ func TestHandlerRegistry_SetAndCall(t *testing.T) {
 		var called bool
 		var receivedMsg TextMessage
 
-		registry.setMessage(func(ctx context.Context, msg TextMessage) (TextMessage, error) {
+		registry.setMessage(&MockAnnotater{}, func(ctx context.Context, telemetry Annotater, msg TextMessage) (TextMessage, error) {
 			called = true
 			receivedMsg = msg
 			return msg, nil
@@ -64,7 +71,7 @@ func TestHandlerRegistry_NoHandlerSet(t *testing.T) {
 	ctx := context.Background()
 
 	// Should not panic when handlers are not set
-	registry.callPresence(ctx, nil, PresenceMessage{})
+	registry.callPresence(ctx, PresenceMessage{})
 	registry.callMessage(ctx, TextMessage{})
 }
 
@@ -80,7 +87,7 @@ func TestHandlerRegistry_ConcurrentAccess(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range iterations {
-			registry.setPresence(func(ctx context.Context, client *Client, msg PresenceMessage) {})
+			registry.setPresence(func(ctx context.Context, msg PresenceMessage) {})
 		}
 	}()
 
@@ -89,7 +96,7 @@ func TestHandlerRegistry_ConcurrentAccess(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range iterations {
-			registry.callPresence(ctx, nil, PresenceMessage{})
+			registry.callPresence(ctx, PresenceMessage{})
 		}
 	}()
 

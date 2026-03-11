@@ -7,12 +7,13 @@ import (
 )
 
 type ClientBuilder struct {
-	name       string
-	apiKey     string
-	logger     *slog.Logger
-	config     Config
-	msgHandler MessageHandler
-	pHandler   PresenceHandler
+	name              string
+	apiKey            string
+	logger            *slog.Logger
+	config            Config
+	msgHandler        MessageHandler
+	pHandler          PresenceHandler
+	transportCallback func(context.Context, string) (Transporter, error)
 }
 
 func NewClient(name, apiKey string) ClientBuilder {
@@ -21,7 +22,15 @@ func NewClient(name, apiKey string) ClientBuilder {
 		apiKey: apiKey,
 		logger: slog.Default(),
 		config: DefaultConfig(),
+		transportCallback: func(ctx context.Context, urlStr string) (Transporter, error) {
+			return NewTransporter(ctx, urlStr)
+		},
 	}
+}
+
+func (cb ClientBuilder) WithTransporter(callback func(context.Context, string) (Transporter, error)) ClientBuilder {
+	cb.transportCallback = callback
+	return cb
 }
 
 func (cb ClientBuilder) WithConfig(cfg Config) ClientBuilder {
@@ -46,21 +55,21 @@ func (cb ClientBuilder) OnPresence(handler PresenceHandler) ClientBuilder {
 
 func (cb ClientBuilder) Connect(ctx context.Context) (*Client, error) {
 	c := &Client{
-		name:            cb.name,
-		apiKey:          cb.apiKey,
-		status:          Disconnected,
-		presence:        Unavailable,
-		handlers:        newHandlerRegistry(),
-		outbound:        make(chan []byte, 32),
-		inbound:         make(chan []byte, 32),
-		auth:            make(chan []byte, 1),
-		config:          cb.config,
-		logger:          cb.logger,
-		pendingMessages: make(map[string]*PendingResponse),
+		name:     cb.name,
+		apiKey:   cb.apiKey,
+		status:   Disconnected,
+		presence: Unavailable,
+		handlers: newHandlerRegistry(),
+		outbound: make(chan []byte, 32),
+		inbound:  make(chan []byte, 32),
+		auth:     make(chan []byte, 1),
+		result:   make(chan error, 1),
+		config:   cb.config,
+		logger:   cb.logger,
 	}
 
 	if cb.msgHandler != nil {
-		c.handlers.setMessage(cb.msgHandler)
+		c.handlers.setMessage(c, cb.msgHandler)
 	} else {
 		cb.logger.WarnContext(ctx, "OnMessage handler was not set")
 	}
@@ -69,7 +78,7 @@ func (cb ClientBuilder) Connect(ctx context.Context) (*Client, error) {
 		c.handlers.setPresence(cb.pHandler)
 	}
 
-	err := c.connect(ctx)
+	err := c.connect(ctx, cb.transportCallback)
 
 	if err != nil {
 		return nil, fmt.Errorf("client builder connect: %w", err)

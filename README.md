@@ -34,7 +34,7 @@ func main() {
 	apiKey := os.Getenv("LLP_API_KEY")
 
 	client, err := llp.NewClient("sample-agent", apiKey).
-		OnMessage(func(ctx context.Context, msg llp.TextMessage) (llp.TextMessage, error) {
+		OnMessage(func(ctx context.Context, telemetry llp.Annotater, msg llp.TextMessage) (llp.TextMessage, error) {
 			// Process msg.Prompt with your agent
 			response := msg.Prompt
 			return msg.Reply(response), nil
@@ -44,8 +44,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	<-ctx.Done()
-	client.Close()
+
+	if err = client.AwaitResult(ctx); err != nil {
+		os.Exit(1)
+	}
 }
 ```
 

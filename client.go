@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/url"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ const (
 	Connecting
 	Connected
 	Authenticated
+	Disconnecting
 	Closed
 )
 
@@ -60,7 +60,7 @@ func DefaultConfig() Config {
 // Client is the main SDK client
 type Client struct {
 	// Connection
-	conn   *websocket.Conn
+	conn   Transporter
 	connMu sync.RWMutex
 
 	// Session state
@@ -81,6 +81,7 @@ type Client struct {
 	outbound chan []byte
 	inbound  chan []byte
 	auth     chan []byte
+	result   chan error
 
 	// Lifecycle
 	cancel func()
@@ -89,9 +90,6 @@ type Client struct {
 	// Config
 	config Config
 	logger *slog.Logger
-
-	pendingMu       sync.Mutex
-	pendingMessages map[string]*PendingResponse
 }
 
 // SessionID returns the current session ID
@@ -115,8 +113,17 @@ func (c *Client) Presence() PresenceStatus {
 	return c.presence
 }
 
+func (c *Client) AwaitResult(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-c.result:
+		return result
+	}
+}
+
 // Connect establishes a Websocket connection to the server
-func (c *Client) connect(ctx context.Context) error {
+func (c *Client) connect(ctx context.Context, dialCallback func(context.Context, string) (Transporter, error)) error {
 	status := c.Status()
 
 	if status != Disconnected {
@@ -131,7 +138,7 @@ func (c *Client) connect(ctx context.Context) error {
 		return fmt.Errorf("invalid url: %w", err)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url.String(), nil)
+	conn, err := dialCallback(ctx, url.String())
 	if err != nil {
 		c.setStatus(Disconnected)
 		return fmt.Errorf("failed to connect: %w", err)
@@ -144,6 +151,17 @@ func (c *Client) connect(ctx context.Context) error {
 	c.setStatus(Connected)
 	c.logger.Info("connected to server", "address", c.config.PlatformURL)
 
+	if err = c.authenticate(); err != nil {
+		return fmt.Errorf("failed to authenticate: %w", err)
+	}
+
+	if err := c.setPresence(Available); err != nil {
+		return fmt.Errorf("set presence: %w", err)
+	}
+	c.presenceAnnouncedMu.Lock()
+	c.presenceAnnounced = true
+	c.presenceAnnouncedMu.Unlock()
+
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
 	c.wg.Add(3)
@@ -151,32 +169,7 @@ func (c *Client) connect(ctx context.Context) error {
 	go c.writeLoop(ctx)
 	go c.dispatcher(ctx)
 
-	return c.authenticate(ctx)
-}
-
-func (c *Client) SendMessage(ctx context.Context, request TextMessage) (*PendingResponse, error) {
-	if request.ID == "" {
-		return nil, errors.New("send message missing ID")
-	}
-
-	c.pendingMu.Lock()
-	_, exists := c.pendingMessages[request.ID]
-	c.pendingMu.Unlock()
-	if exists {
-		return nil, errors.New("send message ID exists")
-	}
-
-	err := c.sendAsyncMessage(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-
-	c.pendingMu.Lock()
-	pr := &PendingResponse{}
-	c.pendingMessages[request.ID] = pr
-	c.pendingMu.Unlock()
-
-	return pr, nil
+	return nil
 }
 
 // Close gracefully shuts down the client
@@ -197,11 +190,7 @@ func (c *Client) Close() error {
 	c.presenceAnnouncedMu.Unlock()
 
 	if shouldSendUnavailable {
-		// Use short timeout for graceful shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		if err := c.setPresence(ctx, Unavailable); err != nil {
+		if err := c.setPresence(Unavailable); err != nil {
 			c.logger.Warn("auto-unavailable failed during close, continuing with shutdown anyway", "error", err)
 			// Continue with shutdown anyway
 		}
@@ -213,6 +202,40 @@ func (c *Client) Close() error {
 	c.setStatus(Closed)
 	c.logger.Debug("client closed")
 
+	return nil
+}
+
+func (c *Client) AnnotateToolCall(ctx context.Context, tc ToolCall) error {
+	if c.Status() != Authenticated {
+		return ErrNotAuthed
+	}
+	td := ToolCallData{
+		To:             tc.Recipient,
+		Name:           tc.Name,
+		Parameters:     tc.Parameters,
+		ThrewException: tc.ThrewException,
+		Result:         tc.Result,
+		Duration:       tc.Duration.Milliseconds(),
+	}
+	t := ToolCallJSON{
+		Type: "tool_call",
+		ID:   tc.ID,
+		Data: td,
+	}
+
+	tJSON, err := json.Marshal(t)
+
+	if err != nil {
+		return fmt.Errorf("annotate json marshal: %w", err)
+	}
+
+	select {
+	case c.outbound <- tJSON:
+	case <-ctx.Done():
+		return fmt.Errorf("annotate outbound: %w", ctx.Err())
+	}
+
+	c.logger.Debug("sending tool call", "to", tc.Recipient, "id", tc.ID, "name", tc.Name, "json", string(tJSON))
 	return nil
 }
 
@@ -245,13 +268,13 @@ func (c *Client) sendAsyncMessage(ctx context.Context, request TextMessage) erro
 		return ctx.Err()
 	}
 
-	c.logger.Debug("sending request", "to", request.Recipient)
+	c.logger.Debug("sending message", "to", request.Recipient, "id", request.ID)
 
 	return nil
 }
 
 // authenticate sends an authentication message and waits for response
-func (c *Client) authenticate(ctx context.Context) error {
+func (c *Client) authenticate() error {
 	if c.Status() != Connected {
 		return ErrNotConnected
 	}
@@ -269,38 +292,35 @@ func (c *Client) authenticate(ctx context.Context) error {
 	}
 
 	// Send the message
-	select {
-	case c.outbound <- data:
-	case <-ctx.Done():
-		return ctx.Err()
+	if err = c.writeMessage(data); err != nil {
+		return fmt.Errorf("auth message write: %w", err)
+	}
+
+	reply, err := c.readMessage()
+	if err != nil {
+		c.handleDisconnect(err)
+		return fmt.Errorf("auth message read: %w", err)
 	}
 
 	var msg AuthenticatedResponse
+	var base baseMessage
+	if err := json.Unmarshal(reply, &base); err != nil {
+		return fmt.Errorf("base message unmarshal: %w", err)
+	}
 
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("authenticate inbound: %w", ctx.Err())
-	case reply := <-c.auth:
-
-		var base baseMessage
-		if err := json.Unmarshal(reply, &base); err != nil {
-			return fmt.Errorf("authenticated message: %w", err)
+	if base.Type == "error" {
+		var errMsg ErrorMessageJSON
+		json.Unmarshal(reply, &errMsg)
+		pErr := PlatformError{
+			Code:    ErrorCode(errMsg.Code),
+			ID:      errMsg.ID,
+			Message: errMsg.Message,
 		}
+		return &pErr
+	}
 
-		if base.Type == "error" {
-			var errMsg ErrorMessageJSON
-			json.Unmarshal(reply, &errMsg)
-			pErr := PlatformError{
-				Code:    ErrorCode(errMsg.Code),
-				ID:      errMsg.ID,
-				Message: errMsg.Message,
-			}
-			return &pErr
-		}
-
-		if err := json.Unmarshal(reply, &msg); err != nil {
-			return fmt.Errorf("authenticated message: %w", err)
-		}
+	if err := json.Unmarshal(reply, &msg); err != nil {
+		return fmt.Errorf("authenticated message unmarshal: %w", err)
 	}
 
 	c.connMu.Lock()
@@ -308,17 +328,6 @@ func (c *Client) authenticate(ctx context.Context) error {
 	c.connMu.Unlock()
 
 	c.setStatus(Authenticated)
-
-	// Auto-presence: send available
-	if err := c.setPresence(ctx, Available); err != nil {
-		c.logger.Warn("auto-presence failed", "error", err)
-
-		// Degrade gracefully - don't fail authentication
-	} else {
-		c.presenceAnnouncedMu.Lock()
-		c.presenceAnnounced = true
-		c.presenceAnnouncedMu.Unlock()
-	}
 
 	return nil
 }
@@ -336,7 +345,7 @@ func (c *Client) setPresenceStatus(status PresenceStatus) {
 	c.presence = status
 }
 
-func (c *Client) setPresence(ctx context.Context, status PresenceStatus) error {
+func (c *Client) setPresence(status PresenceStatus) error {
 	if c.Status() != Authenticated {
 		return ErrNotAuthed
 	}
@@ -353,12 +362,50 @@ func (c *Client) setPresence(ctx context.Context, status PresenceStatus) error {
 
 	data, _ := json.Marshal(p)
 
-	select {
-	case c.outbound <- data:
-		c.setPresenceStatus(status)
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := c.writeMessage(data); err != nil {
+		return fmt.Errorf("write presence: %w", err)
+	}
+
+	if err := c.awaitAck("online"); err != nil {
+		return fmt.Errorf("ack: %w", err)
+	}
+
+	c.setPresenceStatus(status)
+	return nil
+}
+
+func (c *Client) awaitAck(id string) error {
+	buf, err := c.readMessage()
+	if err != nil {
+		return fmt.Errorf("read message: %w", err)
+	}
+	var bm baseMessage
+	err = json.Unmarshal(buf, &bm)
+	if err != nil {
+		c.logger.Error("unmarshal error", "buffer", string(buf))
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+
+	if bm.Type == "ack" {
+		if bm.ID == id {
+			return nil
+		} else {
+			return fmt.Errorf("non-matching id")
+		}
+	}
+
+	if bm.Type == "error" {
+		var errMsg ErrorMessageJSON
+		json.Unmarshal(buf, &errMsg)
+		pErr := PlatformError{
+			Code:    ErrorCode(errMsg.Code),
+			ID:      errMsg.ID,
+			Message: errMsg.Message,
+		}
+		return &pErr
+
+	} else {
+		return fmt.Errorf("unknown message type: %v", bm.Type)
 	}
 }
 
@@ -371,28 +418,15 @@ func (c *Client) readLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			c.handleDisconnect(ctx.Err())
 			return
 		default:
 		}
 
-		if c.conn == nil {
-			return
-		}
-
-		_, buffer, err := c.conn.ReadMessage()
+		buffer, err := c.readMessage()
 		if err != nil {
-			if websocket.IsCloseError(err,
-				websocket.CloseNormalClosure,
-				websocket.CloseAbnormalClosure,
-				websocket.CloseGoingAway,
-				websocket.CloseProtocolError) {
-				c.handleDisconnect()
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			c.handleDisconnect()
+			c.logger.Error("Unrecoverable message read error, disconnecting", "error", err)
+			c.handleDisconnect(err)
 			return
 		}
 
@@ -400,18 +434,10 @@ func (c *Client) readLoop(ctx context.Context) {
 			data := make([]byte, len(buffer))
 			copy(data, buffer)
 
-			if c.Status() != Authenticated {
-				select {
-				case c.auth <- data:
-				case <-ctx.Done():
-					return
-				}
-			} else {
-				select {
-				case c.inbound <- data:
-				case <-ctx.Done():
-					return
-				}
+			select {
+			case c.inbound <- data:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}
@@ -429,24 +455,16 @@ func (c *Client) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case data := <-c.outbound:
-
-			if c.conn == nil {
-				return
-			}
-
-			c.conn.SetWriteDeadline(time.Now().Add(c.config.PingInterval))
-
-			c.logger.Debug("writing message")
-			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			if err := c.writeMessage(data); err != nil {
 				c.logger.Error("write error", "error", err)
-				c.handleDisconnect()
+				c.handleDisconnect(err)
 				return
 			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(3*time.Second)); err != nil {
 				c.logger.Error("ping error", "error", err)
-				c.handleDisconnect()
+				c.handleDisconnect(err)
 				return
 			}
 		case <-ctx.Done():
@@ -455,6 +473,36 @@ func (c *Client) writeLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (c *Client) writeMessage(buf []byte) error {
+	c.conn.SetWriteDeadline(time.Now().Add(c.config.PingInterval))
+
+	c.logger.Debug("writing message")
+	if err := c.conn.WriteMessage(websocket.TextMessage, buf); err != nil {
+		return fmt.Errorf("write error: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) readMessage() ([]byte, error) {
+	_, buffer, err := c.conn.ReadMessage()
+	if err != nil {
+		if websocket.IsCloseError(err,
+			websocket.CloseNormalClosure,
+			websocket.CloseAbnormalClosure,
+			websocket.CloseGoingAway,
+			websocket.CloseProtocolError) {
+			err = fmt.Errorf("websocket close: %w", err)
+			c.handleDisconnect(err)
+			return []byte{}, err
+		}
+		err = fmt.Errorf("read error: %w", err)
+		c.handleDisconnect(err)
+		return []byte{}, err
+	}
+
+	return buffer, nil
 }
 
 // dispatcher routes incoming messages to handlers
@@ -468,7 +516,10 @@ func (c *Client) dispatcher(ctx context.Context) {
 		select {
 		case data := <-c.inbound:
 			c.logger.Debug("received inbound message")
-			c.handleMessage(ctx, data)
+			if err := c.handleMessage(ctx, data); err != nil {
+				c.logger.Error("handle message failure, shutting down.", "error", err)
+				c.handleDisconnect(err)
+			}
 
 		case <-ctx.Done():
 			return
@@ -477,12 +528,10 @@ func (c *Client) dispatcher(ctx context.Context) {
 }
 
 // handleMessage processes a single incoming message
-func (c *Client) handleMessage(ctx context.Context, data []byte) {
-	// First, determine the message type
+func (c *Client) handleMessage(ctx context.Context, data []byte) error {
 	var base baseMessage
 	if err := json.Unmarshal(data, &base); err != nil {
-		c.logger.Error("failed to decode base message", "error", err)
-		return
+		return fmt.Errorf("base message decode: %w", err)
 	}
 
 	// Route based on type
@@ -490,36 +539,27 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 	case "error":
 		var errMsg ErrorMessageJSON
 		if err := json.Unmarshal(data, &errMsg); err != nil {
-			c.logger.Error("failed to decode error message", "error", err)
-			return
+			return fmt.Errorf("error message decode: %w", err)
 		}
 
-		c.pendingMu.Lock()
-		defer c.pendingMu.Unlock()
-		pr, exists := c.pendingMessages[errMsg.ID]
-
-		if exists {
-			err := PlatformError{
-				Code:    ErrorCode(errMsg.Code),
-				ID:      errMsg.ID,
-				Message: errMsg.Message,
-			}
-			pr.setError(err)
+		err := &PlatformError{
+			Code:    ErrorCode(errMsg.Code),
+			ID:      errMsg.ID,
+			Message: errMsg.Message,
 		}
+		return err
 
 	case "presence":
 		var msg PresenceMessageJSON
 		if err := json.Unmarshal(data, &msg); err != nil {
-			c.logger.Error("failed to decode presence message", "error", err)
-			return
+			return fmt.Errorf("presence message decode: %w", err)
 		}
 
 		c.logger.Debug("received presence update", "from", msg.From, "status", msg.Data.Status)
 
 		status, err := ParsePresenceStatus(msg.Data.Status)
 		if err != nil {
-			c.logger.Error("received unknown presence status", "error", err, "status", msg.Data.Status)
-			return
+			return fmt.Errorf("presence status '%v': %w", msg.Data.Status, err)
 		}
 
 		p := PresenceMessage{
@@ -527,26 +567,25 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 			Status:             status,
 			SupportsEncryption: msg.Data.SupportsEncryption,
 		}
-		c.handlers.callPresence(ctx, c, p)
+		c.handlers.callPresence(ctx, p)
 
 	case "message":
-		c.handleMessageCallback(ctx, base.ID, data)
+		return c.handleMessageCallback(ctx, data)
+
+	case "ack":
+		return nil
 
 	default:
 		c.logger.Warn("unknown message type", "type", base.Type)
 	}
+	return nil
 }
 
-func (c *Client) handleMessageCallback(ctx context.Context, ID string, data []byte) {
-	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
-	pr, exists := c.pendingMessages[ID]
-
+func (c *Client) handleMessageCallback(ctx context.Context, data []byte) error {
 	var msg TextMessageJSON
 	err := json.Unmarshal(data, &msg)
 	if err != nil {
-		c.logger.Error("failed to decode message", "error", err)
-		return
+		return fmt.Errorf("message decode: %w", err)
 	}
 
 	m := msg.Data.Prompt
@@ -559,33 +598,32 @@ func (c *Client) handleMessageCallback(ctx context.Context, ID string, data []by
 		Attachment: msg.Data.Attachment,
 	}
 
-	if exists {
-		c.logger.Info("routing pending message")
-		pr.setDone(tm)
-		delete(c.pendingMessages, ID)
-	} else {
-		c.logger.Info("routing to message callback")
-		resp, err := c.handlers.callMessage(ctx, tm)
-		if errors.Is(err, ErrHandlerNotSet) {
-			return
-		}
-
-		if err != nil {
-			// TODO: send an error response back to the platform
-			c.logger.Error("call message handler failure", "error", err)
-			return
-		}
-
-		err = c.sendAsyncMessage(ctx, resp)
-		if err != nil {
-			c.logger.Error("async message response failed", "error", err)
-			return
-		}
+	c.logger.Debug("routing to message callback")
+	resp, err := c.handlers.callMessage(ctx, tm)
+	if errors.Is(err, ErrHandlerNotSet) {
+		return nil
 	}
+
+	if err != nil {
+		// TODO: send an error response back to the platform
+		return fmt.Errorf("message handler: %w", err)
+	}
+
+	err = c.sendAsyncMessage(ctx, resp)
+	if err != nil {
+		c.logger.Error("async message response failed", "error", err)
+		return fmt.Errorf("send async message: %w", err)
+	}
+	return nil
 }
 
 // handleDisconnect handles disconnection events
-func (c *Client) handleDisconnect() {
+func (c *Client) handleDisconnect(err error) {
+	if c.Status() == Disconnected || c.Status() == Disconnecting {
+		return
+	}
+	c.setStatus(Disconnecting)
+
 	c.logger.Info("disconnected from server")
 
 	// Auto-presence: send unavailable if we announced presence
@@ -595,16 +633,13 @@ func (c *Client) handleDisconnect() {
 	c.presenceAnnouncedMu.Unlock()
 
 	if shouldSendUnavailable {
-		// Connection may be dead; use 1s timeout and best-effort send
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-
-		if err := c.setPresence(ctx, Unavailable); err != nil {
+		if err := c.setPresence(Unavailable); err != nil {
 			c.logger.Debug("auto-unavailable failed during disconnect", "error", err)
 			// Connection is dead anyway, this is expected
 		}
 	}
 
 	c.setStatus(Disconnected)
+	c.result <- err
 	c.cancel()
 }
