@@ -274,7 +274,6 @@ func TestClientMessageFailure(t *testing.T) {
 
 			fake.sendMessage(tC.message)
 			require.NoError(t, err)
-			fake.sendClose()
 			e := client.AwaitResult(t.Context())
 			assert.Contains(t, e.Error(), tC.err.Error())
 			assert.Equal(t, client.Status(), Disconnected)

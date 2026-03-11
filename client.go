@@ -21,6 +21,7 @@ const (
 	Connecting
 	Connected
 	Authenticated
+	Disconnecting
 	Closed
 )
 
@@ -297,7 +298,7 @@ func (c *Client) authenticate() error {
 
 	reply, err := c.readMessage()
 	if err != nil {
-		c.handleDisconnect()
+		c.handleDisconnect(err)
 		return fmt.Errorf("auth message read: %w", err)
 	}
 
@@ -417,7 +418,7 @@ func (c *Client) readLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			c.handleDisconnect()
+			c.handleDisconnect(ctx.Err())
 			return
 		default:
 		}
@@ -425,7 +426,7 @@ func (c *Client) readLoop(ctx context.Context) {
 		buffer, err := c.readMessage()
 		if err != nil {
 			c.logger.Error("Unrecoverable message read error, disconnecting", "error", err)
-			c.handleDisconnect()
+			c.handleDisconnect(err)
 			return
 		}
 
@@ -456,14 +457,14 @@ func (c *Client) writeLoop(ctx context.Context) {
 		case data := <-c.outbound:
 			if err := c.writeMessage(data); err != nil {
 				c.logger.Error("write error", "error", err)
-				c.handleDisconnect()
+				c.handleDisconnect(err)
 				return
 			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(3*time.Second)); err != nil {
 				c.logger.Error("ping error", "error", err)
-				c.handleDisconnect()
+				c.handleDisconnect(err)
 				return
 			}
 		case <-ctx.Done():
@@ -493,11 +494,11 @@ func (c *Client) readMessage() ([]byte, error) {
 			websocket.CloseGoingAway,
 			websocket.CloseProtocolError) {
 			err = fmt.Errorf("websocket close: %w", err)
-			c.result <- err
+			c.handleDisconnect(err)
 			return []byte{}, err
 		}
 		err = fmt.Errorf("read error: %w", err)
-		c.result <- err
+		c.handleDisconnect(err)
 		return []byte{}, err
 	}
 
@@ -517,8 +518,7 @@ func (c *Client) dispatcher(ctx context.Context) {
 			c.logger.Debug("received inbound message")
 			if err := c.handleMessage(ctx, data); err != nil {
 				c.logger.Error("handle message failure, shutting down.", "error", err)
-				c.handleDisconnect()
-				c.result <- err
+				c.handleDisconnect(err)
 			}
 
 		case <-ctx.Done():
@@ -618,10 +618,11 @@ func (c *Client) handleMessageCallback(ctx context.Context, data []byte) error {
 }
 
 // handleDisconnect handles disconnection events
-func (c *Client) handleDisconnect() {
-	if c.Status() == Disconnected {
+func (c *Client) handleDisconnect(err error) {
+	if c.Status() == Disconnected || c.Status() == Disconnecting {
 		return
 	}
+	c.setStatus(Disconnecting)
 
 	c.logger.Info("disconnected from server")
 
@@ -639,5 +640,6 @@ func (c *Client) handleDisconnect() {
 	}
 
 	c.setStatus(Disconnected)
+	c.result <- err
 	c.cancel()
 }
